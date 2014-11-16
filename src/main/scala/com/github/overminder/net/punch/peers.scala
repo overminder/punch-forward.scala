@@ -120,8 +120,9 @@ class RawPeer(
 
 object ReliablePeer {
   // Interacts with the app
-  case class AppStream(bs: Array[Byte])
-  case class AppStreams(bss: Array[Array[Byte]])
+  case class AppStream(bs: ByteString)
+
+  case class SetRemote(r: ActorRef)
 
   // Interacts with the remote
   sealed trait Packet extends Serializable {
@@ -232,7 +233,7 @@ object ReliablePeer {
   }
 }
 
-class ReliablePeer(remote: ActorRef, app: ActorRef)
+class ReliablePeer(var remote: ActorRef, app: ActorRef)
   extends Actor with ActorLogging {
 
   import scala.collection.mutable.HashMap
@@ -252,36 +253,35 @@ class ReliablePeer(remote: ActorRef, app: ActorRef)
   context.watch(remote)
   context.watch(app)
 
-  def onAppStream(bs: Array[Byte]) {
+  def onAppStream(bs: ByteString) {
     seqGen = seqGen + 1
-    val pkt = DataPacket(seqGen, ByteString(bs))
+    val pkt = DataPacket(seqGen, bs)
     remote ! pkt
     resender ! Queued.make(DateTime.now, pkt, 100.millis)
   }
 
-  def mergeExtract(): Array[Array[Byte]] = {
-    import scala.collection.mutable.ArrayBuffer
-    val buf = ArrayBuffer[Array[Byte]]()
+  def mergeExtract(): ByteString = {
+    val buf = ByteString.newBuilder
     def go(i: Int): Int = {
       val i2 = i + 1
       deliveryQ.remove(i2) match {
         case Some(payload) =>
-          buf += payload.toArray
+          buf.append(payload)
           go(i2)
         case None =>
           i
       }
     }
     lastDeliverySeq = go(lastDeliverySeq)
-    buf.toArray
+    buf.result
   }
 
   override def receive = {
+    case SetRemote(newRemote) =>
+      remote = newRemote
+
     case AppStream(bs) if state == StateOpen =>
       onAppStream(bs)
-
-    case AppStreams(bss) if state == StateOpen =>
-      bss foreach (onAppStream _)
 
     case Resend(pkt) =>
       remote ! pkt
@@ -294,7 +294,7 @@ class ReliablePeer(remote: ActorRef, app: ActorRef)
       if (lastDeliverySeq < dpkt.id) {
         deliveryQ += ((dpkt.id, dpkt.payload))
         val payloadsToSend = mergeExtract()
-        app ! AppStreams(payloadsToSend)
+        app ! AppStream(payloadsToSend)
       }
 
     case dack: DataAckPacket =>
